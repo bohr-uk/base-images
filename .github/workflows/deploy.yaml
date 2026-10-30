@@ -9,18 +9,20 @@ on:
         default: false
 
 env:
-  ALPINE_VERSION: 3.24
+  ALPINE_VERSION: "3.24"
   REGISTRY: nucleus61bfb23a
 
 jobs:
   apko:
     runs-on: ubuntu-latest
     permissions:
+      id-token: write
+      contents: read
       packages: write
       security-events: write
     steps:
     - name: Checkout project
-      uses: actions/checkout@v6
+      uses: actions/checkout@v4
     
     - name: Login to Azure
       uses: azure/login@v3
@@ -32,15 +34,20 @@ jobs:
 
     - name: Login to Azure Container Registry
       if: ${{ inputs.push_images == true }}
-      run: az acr login --name ${REGISTRY}
+      run: az acr login --name ${{ env.REGISTRY }}
 
     - name: Template Alpine version
-      run: envsubst < ./apko/jlink.yml > ./apko/jlink.yml
+      run: |
+        envsubst < ./apko/jlink.yml > ./apko/jlink.tmp
+        mv ./apko/jlink.tmp ./apko/jlink.yml
 
     - name: Build JLink
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          ${{ inputs.push_images && 'publish' || 'build' }} ./apko/jlink.yml
-          ${REGISTRY}/alpine:${ALPINE_VERSION}-jlink
-          ${{ inputs.push_images == false && 'image.tar' }}
+      run: |
+        docker run --rm \
+          -v "${PWD}:/work" -w /work \
+          -v "${HOME}/.docker:/root/.docker:ro" \
+          cgr.dev/chainguard/apko \
+          ${{ inputs.push_images && 'publish' || 'build' }} \
+          ./apko/jlink.yml \
+          ${{ env.REGISTRY }}.azurecr.io/alpine:${{ env.ALPINE_VERSION }}-jlink \
+          ${{ !inputs.push_images && 'image.tar' || '' }}

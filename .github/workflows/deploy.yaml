@@ -1,7 +1,16 @@
 name: Build and Publish Images
+
 on:
   push:
   workflow_dispatch:
+    inputs:
+      push_images:
+        type: boolean
+        default: false
+
+env:
+  ALPINE_VERSION: 3.24
+  REGISTRY: nucleus61bfb23a
 
 jobs:
   apko:
@@ -15,19 +24,23 @@ jobs:
     
     - name: Login to Azure
       uses: azure/login@v3
+      if: ${{ inputs.push_images == true }}
       with:
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
 
     - name: Login to Azure Container Registry
-      run: az acr login --name $REGISTRY
+      if: ${{ inputs.push_images == true }}
+      run: az acr login --name ${REGISTRY}
+
+    - name: Template Alpine version
+      run: envsubst < ./apko/jlink.yml > ./apko/jlink.yml
 
     - name: Build JLink
       uses: docker://cgr.dev/chainguard/apko
       with:
         args: >
-          publish ./apko/jlink.yml
-          $REGISTRY/alpine:3.22-jlink
-          $REGISTRY/alpine:3-jlink
-          $REGISTRY/alpine:jlink
+          ${{ inputs.push_images && 'publish' || 'build' }} ./apko/jlink.yml
+          ${REGISTRY}/alpine:${ALPINE_VERSION}-jlink
+          ${{ inputs.push_images == false && 'image.tar' }}

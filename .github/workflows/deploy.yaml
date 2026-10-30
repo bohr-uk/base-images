@@ -1,10 +1,7 @@
-name: Deploy Images
+name: Build and Publish Images
 on:
   push:
   workflow_dispatch:
-
-env:
-  REGISTRY: ghcr.io/dansiviter
 
 jobs:
   apko:
@@ -14,86 +11,23 @@ jobs:
       security-events: write
     steps:
     - name: Checkout project
-      uses: actions/checkout@v3
-
-    - name: Registry Login
-      uses: docker://cgr.dev/chainguard/apko
+      uses: actions/checkout@v6
+    
+    - name: Login to Azure
+      uses: azure/login@v3
       with:
-        args: login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
 
-    - name: Build MiniRootFS
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          publish ./apko/minirootfs.yml
-          ${{ env.REGISTRY }}/alpine:3.22-minirootfs
-          ${{ env.REGISTRY }}/alpine:3-minirootfs
-          ${{ env.REGISTRY }}/alpine:minirootfs
-
-    - name: Build base
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          publish ./apko/base.yml
-          ${{ env.REGISTRY }}/alpine:3.22-base
-          ${{ env.REGISTRY }}/alpine:3-base
-          ${{ env.REGISTRY }}/alpine:base
-
-    - name: Build musl
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          publish ./apko/musl.yml
-          ${{ env.REGISTRY }}/alpine:3.22-musl
-          ${{ env.REGISTRY }}/alpine:3-musl
-          ${{ env.REGISTRY }}/alpine:musl
+    - name: Login to Azure Container Registry
+      run: az acr login --name $REGISTRY
 
     - name: Build JLink
       uses: docker://cgr.dev/chainguard/apko
       with:
         args: >
           publish ./apko/jlink.yml
-          ${{ env.REGISTRY }}/alpine:3.22-jlink
-          ${{ env.REGISTRY }}/alpine:3-jlink
-          ${{ env.REGISTRY }}/alpine:jlink
-
-    - name: Build JRE17
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          publish ./apko/jre17.yml
-          ${{ env.REGISTRY }}/alpine:3.22-jre17
-          ${{ env.REGISTRY }}/alpine:3-jre17
-          ${{ env.REGISTRY }}/alpine:jre17
-
-    - name: Build JRE21
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          publish ./apko/jre21.yml
-          ${{ env.REGISTRY }}/alpine:3.22-jre21
-          ${{ env.REGISTRY }}/alpine:3-jre21
-          ${{ env.REGISTRY }}/alpine:jre21
-
-    - name: Build JRE25
-      uses: docker://cgr.dev/chainguard/apko
-      with:
-        args: >
-          publish ./apko/jre25.yml
-          ${{ env.REGISTRY }}/alpine:3.22-jre25
-          ${{ env.REGISTRY }}/alpine:3-jre25
-          ${{ env.REGISTRY }}/alpine:jre25
-
-    - name: Scan for vulnerabilities
-      continue-on-error: true
-      uses: snyk/actions/docker@v1.0.0
-      env:
-        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      with:
-        image: ${{ env.REGISTRY }}/alpine:3.22-jlink
-        args: --file=./apko/jlink.yml
-
-    - name: Upload result to GitHub Code Scanning
-      uses: github/codeql-action/upload-sarif@v3
-      with:
-        sarif_file: snyk.sarif
+          $REGISTRY/alpine:3.22-jlink
+          $REGISTRY/alpine:3-jlink
+          $REGISTRY/alpine:jlink

@@ -1,53 +1,141 @@
 name: Build and Publish Images
 
 on:
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - .gitignore
+      - README.md
   push:
+    paths-ignore:
+      - .gitignore
+      - README.md
+  schedule:
+    - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
       push_images:
+        description: Publish built images to Azure Container Registry (main branch only)
         type: boolean
         default: false
 
+permissions:
+  contents: read
+
 env:
-  ALPINE_VERSION: "3.24"
-  REGISTRY: nucleus61bfb23a
+  REGISTRY: ${{ vars.ACR_NAME || 'nucleus61bfb23a' }}
+  IMAGE_REPOSITORY: bohr-uk/alpine
+  APKO_VERSION: "1.5.0"
+  APKO_SHA256: "611cd21aad41dbef2a2698087ebfbb308ba6b0f171797e5571033fb6622ba708"
 
 jobs:
-  apko:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      alpine_version: ${{ steps.alpine.outputs.alpine_version }}
+      alpine_major: ${{ steps.alpine.outputs.alpine_major }}
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v6
+
+      - name: Resolve Alpine version
+        id: alpine
+        run: |
+          ALPINE_VERSION=$(grep -oP 'alpine/v\K[0-9]+\.[0-9]+' ./apko/jlink.yml | head -n 1)
+          if [ -z "${ALPINE_VERSION}" ]; then
+            echo "::error::Failed to extract Alpine version from ./apko/jlink.yml"
+            exit 1
+          fi
+          ALPINE_MAJOR="${ALPINE_VERSION%%.*}"
+          echo "alpine_version=${ALPINE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "alpine_major=${ALPINE_MAJOR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install apko
+        run: |
+          mkdir -p "${RUNNER_TEMP}/apko-extract" "${HOME}/.local/bin"
+          curl -fsSL "https://github.com/chainguard-dev/apko/releases/download/v${APKO_VERSION}/apko_${APKO_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/apko.tar.gz"
+          echo "${APKO_SHA256}  ${RUNNER_TEMP}/apko.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/apko.tar.gz" -C "${RUNNER_TEMP}/apko-extract" --strip-components=1
+          install -m 0755 "${RUNNER_TEMP}/apko-extract/apko" "${HOME}/.local/bin/apko"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          rm -rf "${RUNNER_TEMP}/apko.tar.gz" "${RUNNER_TEMP}/apko-extract"
+
+      - name: Build JLink image
+        run: |
+          apko build \
+            ./apko/jlink.yml \
+            "${REGISTRY}.azurecr.io/${IMAGE_REPOSITORY}:${{ steps.alpine.outputs.alpine_version }}-jlink" \
+            image.tar
+
+      - name: Scan JLink image for vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          input: image.tar
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          vuln-type: os
+          severity: CRITICAL,HIGH
+
+  publish:
+    needs: build
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (
+        github.event_name == 'push' ||
+        github.event_name == 'schedule' ||
+        (github.event_name == 'workflow_dispatch' && inputs.push_images == true)
+      )
     runs-on: ubuntu-latest
     permissions:
-      id-token: write
       contents: read
-      packages: write
-      security-events: write
+      id-token: write
     steps:
-    - name: Checkout project
-      uses: actions/checkout@v4
-    
-    - name: Login to Azure
-      uses: azure/login@v3
-      if: ${{ inputs.push_images == true }}
-      with:
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+      - name: Checkout project
+        uses: actions/checkout@v6
 
-    - name: Login to Azure Container Registry
-      if: ${{ inputs.push_images == true }}
-      run: az acr login --name ${{ env.REGISTRY }}
+      - name: Install apko
+        run: |
+          mkdir -p "${RUNNER_TEMP}/apko-extract" "${HOME}/.local/bin"
+          curl -fsSL "https://github.com/chainguard-dev/apko/releases/download/v${APKO_VERSION}/apko_${APKO_VERSION}_linux_amd64.tar.gz" \
+            -o "${RUNNER_TEMP}/apko.tar.gz"
+          echo "${APKO_SHA256}  ${RUNNER_TEMP}/apko.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/apko.tar.gz" -C "${RUNNER_TEMP}/apko-extract" --strip-components=1
+          install -m 0755 "${RUNNER_TEMP}/apko-extract/apko" "${HOME}/.local/bin/apko"
+          echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
+          rm -rf "${RUNNER_TEMP}/apko.tar.gz" "${RUNNER_TEMP}/apko-extract"
 
-    - name: Template Alpine version
-      run: |
-        envsubst < ./apko/jlink.yml > ./apko/jlink.tmp
-        mv ./apko/jlink.tmp ./apko/jlink.yml
+      - name: Login to Azure
+        uses: azure/login@v3
+        with:
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
 
-    - name: Build JLink
-      run: |
-        docker run --rm \
-          -v "${PWD}:/work" -w /work \
-          -v "${HOME}/.docker:/root/.docker:ro" \
-          cgr.dev/chainguard/apko \
-          ${{ inputs.push_images && 'publish' || 'build' }} \
-          ./apko/jlink.yml \
-          ${{ env.REGISTRY }}.azurecr.io/alpine:${{ env.ALPINE_VERSION }}-jlink \
-          ${{ !inputs.push_images && 'image.tar' || '' }}
+      - name: Login to Azure Container Registry
+        run: |
+          TEMP_DOCKER_CONFIG="$(mktemp -d)"
+          trap 'rm -rf "${TEMP_DOCKER_CONFIG}"' EXIT
+          ACR_TOKEN=$(DOCKER_CONFIG="${TEMP_DOCKER_CONFIG}" az acr login \
+            --name "${REGISTRY}" \
+            --expose-token \
+            --query accessToken \
+            --output tsv < /dev/null)
+          printf '%s\n' "${ACR_TOKEN}" | apko login "${REGISTRY}.azurecr.io" \
+            --username 00000000-0000-0000-0000-000000000000 \
+            --password-stdin
+
+      - name: Publish JLink image
+        env:
+          ALPINE_VERSION: ${{ needs.build.outputs.alpine_version }}
+          ALPINE_MAJOR: ${{ needs.build.outputs.alpine_major }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          IMAGE_BASE="${REGISTRY}.azurecr.io/${IMAGE_REPOSITORY}"
+          apko publish ./apko/jlink.yml \
+            "${IMAGE_BASE}:${ALPINE_VERSION}-jlink" \
+            "${IMAGE_BASE}:${ALPINE_MAJOR}-jlink" \
+            "${IMAGE_BASE}:jlink" \
+            "${IMAGE_BASE}:${ALPINE_VERSION}-jlink-${SHORT_SHA::7}"

@@ -1,4 +1,5 @@
 *.tar
 *.tmp
 sbom*
+oci-dir/
 .cache/

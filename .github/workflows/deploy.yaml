@@ -28,6 +28,8 @@ env:
   IMAGE_REPOSITORY: bohr-uk/alpine
   APKO_VERSION: "1.5.0"
   APKO_SHA256: "611cd21aad41dbef2a2698087ebfbb308ba6b0f171797e5571033fb6622ba708"
+  CRANE_VERSION: "0.22.1"
+  CRANE_SHA256: "0ab7a1d6932a213aed964ce97666c3077fe691c8606413674a8b3e0b9ec4cda0"
 
 jobs:
   build:
@@ -35,6 +37,7 @@ jobs:
     outputs:
       alpine_version: ${{ steps.alpine.outputs.alpine_version }}
       alpine_major: ${{ steps.alpine.outputs.alpine_major }}
+      oci_tar_sha256: ${{ steps.archive.outputs.oci_tar_sha256 }}
     steps:
       - name: Checkout project
         uses: actions/checkout@v6
@@ -62,22 +65,54 @@ jobs:
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
           rm -rf "${RUNNER_TEMP}/apko.tar.gz" "${RUNNER_TEMP}/apko-extract"
 
-      - name: Build JLink image
+      - name: Build JLink OCI layout
         run: |
+          mkdir -p ./oci-dir
           apko build \
+            --sbom-path . \
             ./apko/jlink.yml \
             "${REGISTRY}.azurecr.io/${IMAGE_REPOSITORY}:${{ steps.alpine.outputs.alpine_version }}-jlink" \
-            image.tar
+            ./oci-dir/
 
       - name: Scan JLink image for vulnerabilities
         uses: aquasecurity/trivy-action@v0.36.0
         with:
-          input: image.tar
+          input: oci-dir
+          scanners: vuln
           format: table
           exit-code: "1"
           ignore-unfixed: true
           vuln-type: os
           severity: CRITICAL,HIGH
+
+      - name: Package OCI layout archive
+        id: archive
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (
+            github.event_name == 'push' ||
+            github.event_name == 'schedule' ||
+            (github.event_name == 'workflow_dispatch' && inputs.push_images == true)
+          )
+        run: |
+          tar -cf oci-layout.tar -C ./oci-dir .
+          SHA256=$(sha256sum oci-layout.tar | awk '{print $1}')
+          echo "oci_tar_sha256=${SHA256}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload scanned OCI layout artifact
+        if: >-
+          github.ref == 'refs/heads/main' &&
+          (
+            github.event_name == 'push' ||
+            github.event_name == 'schedule' ||
+            (github.event_name == 'workflow_dispatch' && inputs.push_images == true)
+          )
+        uses: actions/upload-artifact@v7
+        with:
+          name: jlink-oci-layout
+          path: oci-layout.tar
+          if-no-files-found: error
+          retention-days: 1
 
   publish:
     needs: build
@@ -93,19 +128,33 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - name: Checkout project
-        uses: actions/checkout@v6
+      - name: Download scanned OCI layout artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: jlink-oci-layout
 
-      - name: Install apko
+      - name: Verify and extract scanned OCI layout
+        env:
+          EXPECTED_SHA256: ${{ needs.build.outputs.oci_tar_sha256 }}
         run: |
-          mkdir -p "${RUNNER_TEMP}/apko-extract" "${HOME}/.local/bin"
-          curl -fsSL "https://github.com/chainguard-dev/apko/releases/download/v${APKO_VERSION}/apko_${APKO_VERSION}_linux_amd64.tar.gz" \
-            -o "${RUNNER_TEMP}/apko.tar.gz"
-          echo "${APKO_SHA256}  ${RUNNER_TEMP}/apko.tar.gz" | sha256sum -c -
-          tar -xzf "${RUNNER_TEMP}/apko.tar.gz" -C "${RUNNER_TEMP}/apko-extract" --strip-components=1
-          install -m 0755 "${RUNNER_TEMP}/apko-extract/apko" "${HOME}/.local/bin/apko"
+          if [ -z "${EXPECTED_SHA256}" ]; then
+            echo "::error::Missing expected SHA256 checksum for oci-layout.tar"
+            exit 1
+          fi
+          echo "${EXPECTED_SHA256}  oci-layout.tar" | sha256sum -c -
+          mkdir -p ./oci-dir
+          tar -xf oci-layout.tar -C ./oci-dir
+
+      - name: Install crane
+        run: |
+          mkdir -p "${HOME}/.local/bin"
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            -o "${RUNNER_TEMP}/crane.tar.gz"
+          echo "${CRANE_SHA256}  ${RUNNER_TEMP}/crane.tar.gz" | sha256sum -c -
+          tar -xzf "${RUNNER_TEMP}/crane.tar.gz" -C "${HOME}/.local/bin" crane
+          chmod 0755 "${HOME}/.local/bin/crane"
           echo "${HOME}/.local/bin" >> "${GITHUB_PATH}"
-          rm -rf "${RUNNER_TEMP}/apko.tar.gz" "${RUNNER_TEMP}/apko-extract"
+          rm -f "${RUNNER_TEMP}/crane.tar.gz"
 
       - name: Login to Azure
         uses: azure/login@v3
@@ -123,19 +172,19 @@ jobs:
             --expose-token \
             --query accessToken \
             --output tsv < /dev/null)
-          printf '%s\n' "${ACR_TOKEN}" | apko login "${REGISTRY}.azurecr.io" \
+          printf '%s\n' "${ACR_TOKEN}" | crane auth login "${REGISTRY}.azurecr.io" \
             --username 00000000-0000-0000-0000-000000000000 \
             --password-stdin
 
-      - name: Publish JLink image
+      - name: Publish scanned JLink image
         env:
           ALPINE_VERSION: ${{ needs.build.outputs.alpine_version }}
           ALPINE_MAJOR: ${{ needs.build.outputs.alpine_major }}
           SHORT_SHA: ${{ github.sha }}
         run: |
           IMAGE_BASE="${REGISTRY}.azurecr.io/${IMAGE_REPOSITORY}"
-          apko publish ./apko/jlink.yml \
-            "${IMAGE_BASE}:${ALPINE_VERSION}-jlink" \
-            "${IMAGE_BASE}:${ALPINE_MAJOR}-jlink" \
-            "${IMAGE_BASE}:jlink" \
-            "${IMAGE_BASE}:${ALPINE_VERSION}-jlink-${SHORT_SHA::7}"
+          IMMUTABLE_TAG="${ALPINE_VERSION}-jlink-${SHORT_SHA::7}"
+          crane push --index ./oci-dir "${IMAGE_BASE}:${IMMUTABLE_TAG}"
+          crane tag "${IMAGE_BASE}:${IMMUTABLE_TAG}" "${ALPINE_VERSION}-jlink"
+          crane tag "${IMAGE_BASE}:${IMMUTABLE_TAG}" "${ALPINE_MAJOR}-jlink"
+          crane tag "${IMAGE_BASE}:${IMMUTABLE_TAG}" "jlink"

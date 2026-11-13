@@ -11,9 +11,9 @@ Minimal OCI base images built with [apko](https://github.com/chainguard-dev/apko
 ## CI / Publishing
 
 The GitHub Actions workflow (`.github/workflows/deploy.yaml`):
-- **Pull Requests (`main`):** Builds `apko/jlink.yml` into `image.tar` and scans OS packages for `HIGH` / `CRITICAL` vulnerabilities with Trivy.
-- **Pushes to `main` & Weekly Schedule (`Mondays 06:00 UTC`):** Builds and scans the image first, then authenticates to Azure Container Registry via OIDC and publishes all tags using `apko publish`.
-- **Manual Dispatch (`workflow_dispatch`):** Builds and scans on any branch; optionally publishes to ACR when run from `main` with `push_images: true`.
+- **Branch Pushes & Pull Requests:** Builds `apko/jlink.yml` into an OCI layout directory (`./oci-dir/`) and scans OS packages for `HIGH` / `CRITICAL` vulnerabilities with Trivy.
+- **Pushes to `main` & Weekly Schedule (`Mondays 06:00 UTC`):** Transfers the exact Trivy-scanned OCI layout artifact (SHA-256 verified) to an isolated `publish` job, authenticates to Azure Container Registry via OIDC, pushes the immutable image with `crane push --index`, and aliases the rolling tags (`3.24-jlink`, `3-jlink`, `jlink`) via `crane tag`.
+- **Manual Dispatch (`workflow_dispatch`):** Builds and scans on any branch; optionally publishes the scanned image to ACR when run from `main` with `push_images: true`.
 
 ## Local Development
 
